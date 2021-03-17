@@ -42,14 +42,16 @@ def loss_func(y_hat, y_true, base=None, epoch=None):
         dimH = y_hat.shape[-1]
         if base == "all":
             # TODO put this elsewhere?
+            #####
             _rel_space = [None] * dimH
             for _base in range(dimH):
                 _dif = rel_space_dif(y_hat, y_true, _base)
                 _psuedo_mse = _dif.square().mean(axis=0).reshape(-1,1) # now H x 1: differences for each H relative to _base
                 _rel_space[_base] = _psuedo_mse
-            _rel_space = torch.column_stack(_rel_space) # H x H
+            _rel_space = torch.cat(_rel_space,axis=1) # H x H
             mse = _rel_space[_rel_space != 0].mean() # take the mean of the non-zero values
             return mse
+            #####
         elif isinstance(base, int):
             _base = base
         elif base == "random":
@@ -208,17 +210,29 @@ class Trainer:
                (self.train_y_hat, self.train_y_true), \
                (self.val_y_hat, self.val_y_true)
     
-
     def pickle_save(self, trial_num):
-        fprefix = self.TRAIN_CONFIGS.get("lti_file").split(".")[0]
-        name = fprefix + f"-trial{trial_num}"
-        if not np.char.endswith(name,".pickle"):
-            name += ".pickle"
-        model_dir = self.TRAIN_CONFIGS.get("model_dir")
-        with open(path.join(model_dir,name), "wb") as f:
+        p = Trainer._pickle_path(self.TRAIN_CONFIGS, trial_num)
+        with open(p, "wb") as f:
             pickle.dump(self, f)
 
-    def _gen_relative_graphs(self, hat, true, dimH, val_begins, fname_prefix=None, freq=10):
+    def _gen_relative_graphs(self, hat, true, dimH, val_begins, trial_num=0, fname_prefix=None, freq=10):
+        Trainer.gen_relative_graphs(hat, true, dimH, val_begins, trial_num, self.TRAIN_CONFIGS.get("fig_dir"), fname_prefix, freq)
+
+    @staticmethod
+    def pickled_exists(TRAIN_CONFIGS, trial_num):
+        p = Trainer._pickle_path(TRAIN_CONFIGS, trial_num)
+        return path.exists(p)
+
+    @staticmethod
+    def _pickle_path(TRAIN_CONFIGS, trial_num):
+        name = Trainer.model_name(TRAIN_CONFIGS, trial_num)
+        if not np.char.endswith(name,".pickle"):
+            name += ".pickle"
+        model_dir = TRAIN_CONFIGS.get("model_dir")
+        return path.join(model_dir,name)
+
+    @staticmethod
+    def _gen_relative_graphs(hat, true, dimH, val_begins, trial_num=0, fig_dir=None, fname_prefix=None, freq=10, pause=False):
         val_ends = hat.shape[0]
         palette ={"H1": "C0", "H2": "C1", "H3": "C2"}
         for _base in range(dimH):
@@ -236,16 +250,36 @@ class Trainer:
             sns.lineplot(data=_df, x="Itteration", y="Error", hue="Hidden States", alpha=1, palette=palette)
             plt.title(f"Relative Difference (Base: H{_base+1})")
             plt.axvspan(val_begins, val_ends, facecolor="0.1", alpha=0.25)
-            if not fname_prefix is None:
-                fig_dir = self.TRAIN_CONFIGS.get("fig_dir")
-                fname = fname_prefix+f"-relgraph-H{_base+1}"
+            if not fname_prefix is None and not fig_dir is None:
+                fname = fname_prefix+f"-relgraph-H{_base+1}-trial{trial_num}"
                 f = path.join(fig_dir, fname)
                 plt.savefig(path.join(fig_dir, fname))
-            plt.show()
+            else:
+                print(f"fname_prefix='{fname_prefix}'; fig_dir='{fig_dir}'")
+            if pause:
+                plt.show()
+            else:
+                plt.show(block=False)
             plt.clf()
+
+    @staticmethod
+    def model_name(TRAIN_CONFIGS, trial_num):
+        fprefix = TRAIN_CONFIGS.get("lti_file").split(".")[0]
+        name = fprefix + f"-trial{trial_num}"
+        return name
+
+    @staticmethod
+    def load_trained(TRAIN_CONFIGS, trial_num):
+        model_dir = TRAIN_CONFIGS.get("model_dir")
+        name = Trainer.model_name(TRAIN_CONFIGS, trial_num)
+        if not np.char.endswith(name,".pickle"):
+            name += ".pickle"
+        with open(path.join(model_dir, name), "rb") as f:
+            trainer = pickle.load(f)
+        return trainer
+        
     
-    @property
-    def gen_relative_graphs(self):
+    def gen_relative_graphs(self, trial_num, freq=10, pause=False):
         train_hat, train_true, val_hat, val_true = self.train_y_hat, self.train_y_true, self.val_y_hat, self.val_y_true
         # derived
         dimH = train_hat.shape[-1]
@@ -255,13 +289,23 @@ class Trainer:
         true = np.concatenate([train_true, val_true])
         # graph
         fprefix = self.TRAIN_CONFIGS.get("lti_file").split(".pickle")[0]
-        self._gen_relative_graphs(hat, true, dimH, val_begins, fprefix)
+
+        Trainer._gen_relative_graphs(hat, true, dimH, val_begins, trial_num, self.TRAIN_CONFIGS.get("fig_dir"), fprefix, freq=10, pause=False)
         
     @property
     def get_train_test_metrics(self):
         state_tups = [(self.train_y_hat, self.train_y_true), (self.val_y_hat, self.val_y_true)]
         train, test = [all_state_metrics(state_hat, state_true) for state_hat, state_true in state_tups]
+
         return train, test
 
+    def save_train_test_metrics(self, trial_num):
+        metrics_dir = self.TRAIN_CONFIGS.get("metrics_dir")
 
-        
+        train, test = self.get_train_test_metrics
+        _name = Trainer.model_name(self.TRAIN_CONFIGS, trial_num)
+
+        train.to_csv(path.join(metrics_dir, _name+"-train.csv"))
+        test.to_csv(path.join(metrics_dir, _name+"-val.csv"))
+
+        return train, test
