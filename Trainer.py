@@ -12,6 +12,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# TODO when target == "output" make the graphs, indices, etc... have a Y on them instead of of H and be called "output".
+
 def tensor_to_cuda(*tensors, non_blocking=True):
     def cuda(t):
         if t is not None:
@@ -39,12 +41,12 @@ def loss_func(y_hat, y_true, base=None, epoch=None):
     if base == "direct":
         pass
     else:
-        dimH = y_hat.shape[-1]
+        dimOut = y_hat.shape[-1]
         if base == "all":
             # TODO put this elsewhere?
             #####
-            _rel_space = [None] * dimH
-            for _base in range(dimH):
+            _rel_space = [None] * dimOut
+            for _base in range(dimOut):
                 _dif = rel_space_dif(y_hat, y_true, _base)
                 _psuedo_mse = _dif.square().mean(axis=0).reshape(-1,1) # now H x 1: differences for each H relative to _base
                 _rel_space[_base] = _psuedo_mse
@@ -55,29 +57,32 @@ def loss_func(y_hat, y_true, base=None, epoch=None):
         elif isinstance(base, int):
             _base = base
         elif base == "random":
-            _base = epoch % dimH
+            _base = epoch % dimOut
         else:
             raise ValueError(f"Invalid argument base='{base}'." )
     return rel_space_dif(y_hat, y_true, _base).square().mean()
 
-def as_df(dif, name):
+def as_df(dif, name, isState):
     square_dif = dif.square()
     mse = square_dif.mean(axis=0).reshape(-1,1)
     std = square_dif.std(axis=0).reshape(-1,1)
 
     df = pd.DataFrame(np.column_stack([mse,std]), columns=["mse","std"])
-    df.index = "H"+(df.index+1).astype(str)
+
+    _pre = "H" if isState else "Y"
+    df.index = _pre+(df.index+1).astype(str)
     df = pd.DataFrame(df.stack())
     df.columns = [name]
     return df
 
-def state_relative_spacing_metrics(state_hat, state_true):
-    state_hat, state_true = state_hat.squeeze(), state_true.squeeze()
-    dimH = state_hat.shape[-1]
-    _rel_space = [None]*dimH
-    for _base in range(dimH):
-        _dif = rel_space_dif(state_hat, state_true, _base)
-        _df = as_df(_dif, "Base H"+str(_base))
+def relative_spacing_metrics(_hat, _true, isState):
+    _hat, _true = _hat.squeeze(), _true.squeeze()
+    dimTarget = _hat.shape[-1]
+    _rel_space = [None]*dimTarget
+    for _base in range(dimTarget):
+        _dif = rel_space_dif(_hat, _true, _base)
+        _pre = "Base H" if isState else "Base Y"
+        _df = as_df(_dif, _pre+str(_base), isState)
         _df.columns = pd.MultiIndex.from_product([["Relative Spacing"], _df.columns])
         _rel_space[_base] = _df
     _rel_space = pd.concat(_rel_space, axis=1)
@@ -89,26 +94,26 @@ def state_relative_spacing_metrics(state_hat, state_true):
                              .rename({0:"Relative Spacing"},axis=1)
     return _rel_space
 
-def state_values_metrics(state_hat, state_true):
+def state_values_metrics(state_hat, state_true, isState):
     state_hat, state_true = state_hat.squeeze(), state_true.squeeze()
     _dif = state_hat - state_true
-    _value = as_df(_dif, "Value")
+    _value = as_df(_dif, "Value", isState)
     return _value
 
-def state_delta_percent(state_hat, state_true):
+def state_delta_percent(state_hat, state_true, isState):
     state_hat, state_true = state_hat.squeeze(), state_true.squeeze()
     _dif = delta_percent(state_hat) - delta_percent(state_true)
-    _delta_perc = as_df(_dif, "Delta Percent")
+    _delta_perc = as_df(_dif, "Delta Percent", isState)
     return _delta_perc
 
-def all_state_metrics(state_hat, state_true):
+def all_state_metrics(state_hat, state_true, isState):
     state_hat, state_true = state_hat.squeeze(), state_true.squeeze()
     # state values
-    _value = state_values_metrics(state_hat, state_true)
+    _value = state_values_metrics(state_hat, state_true, isState)
     # relative spacing
-    _rel_space = state_relative_spacing_metrics(state_hat, state_true)
+    _rel_space = relative_spacing_metrics(state_hat, state_true, isState)
     # delta percent
-    _delta_perc = state_delta_percent(state_hat, state_true)
+    _delta_perc = state_delta_percent(state_hat, state_true, isState)
     return pd.concat([_value, _rel_space, _delta_perc],axis=1)
 
 
@@ -118,6 +123,9 @@ class Trainer:
         self.GRU_CONFIGS = self._process_gru_configs(GRU_CONFIGS)
         self.model = RNN(target=TRAIN_CONFIGS['target'],**self.GRU_CONFIGS, FFN_CONFIGS=FFN_CONFIGS)
         self.epochs_trained = 0
+        self.trained = False
+        # Storage for later
+        self.loss = self.val_loss = self.train_y_hat = self.train_y_true = self.val_y_hat = self.val_y_true = None
 
     def _process_gru_configs(self, GRU_CONFIGS):
         lti = self._load_data_source
@@ -148,64 +156,69 @@ class Trainer:
             return M
         lti = self._load_data_source
         Y, H, X, h0 = lti.torch
-        (_Y, _H, _X), _h0 = unsqueeze(Y, H, X), h0.reshape(self.GRU_CONFIGS["num_layers"],
-                                                               1,
-                                                               self.GRU_CONFIGS["hidden_size"])
+        _Y, _H, _X = unsqueeze(Y, H, X)
+        _h0 = None if self.TRAIN_CONFIGS.get("init_h") == False else h0.reshape(self.GRU_CONFIGS["num_layers"],
+                                                                             1,
+                                                                             self.GRU_CONFIGS["hidden_size"])
         return _Y, _H, _X, _h0
 
     @property
     def fit(self):
-        # get configs (for readability)
-        nEpochs = self.TRAIN_CONFIGS['epochs']
-        train_steps = self.TRAIN_CONFIGS['train_steps']
-        init_h = self.TRAIN_CONFIGS['init_h']
-        base = self.TRAIN_CONFIGS['base']
-        # load data
-        Y, H, X, h0 = tensor_to_cuda(*self._load_train_data)
-        # split data
-        if self.TRAIN_CONFIGS['target'] == 'states':
-            y_train, y_val = H[:train_steps], H[train_steps:]
-        elif self.TRAIN_CONFIGS['target'] == 'outputs':
-            y_train, y_val = Y[:train_steps], X[train_steps:]
-        x_train, x_val = X[:train_steps], X[train_steps:]
-        # prep model and optimizers
-        self.model.cuda()
-        optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2)
-        # trian
-        loss = [None]*nEpochs
-        val_loss = [None]*nEpochs
-        pbar = tqdm(total=nEpochs, leave=False)
-        for i in range(nEpochs):
-            # reset gradient
-            optimizer.zero_grad()
-            # generate prediction
-            y_hat, h_plus1 = self.model(x_train) if not init_h else self.model(x_train, h0)
-            y_hat = y_hat.squeeze()
-            # calculate loss
-            l = loss_func(y_hat, y_train, base=self.TRAIN_CONFIGS['base'], epoch=i)
-            loss[i] = l.item()
-            # learn from loss
-            l.backward()
-            optimizer.step()
-            scheduler.step(l.item())
-            # validate
-            with torch.no_grad():
-                val_y_hat, _ = self.model(x_val) if not init_h else self.model(x_val, h_plus1)
-                val_y_hat = val_y_hat.squeeze()
-                l = loss_func(val_y_hat, y_val, base=self.TRAIN_CONFIGS['base'], epoch=i)
-                val_loss[i] = l.item()
-            # decorator
-            pbar.set_description(f"Loss={loss[i]:.3f}. Val={val_loss[i]:.3f}")
-            pbar.update(1)
+        if self.trained == False:
+            # get configs (for readability)
+            nEpochs = self.TRAIN_CONFIGS['epochs']
+            train_steps = self.TRAIN_CONFIGS['train_steps']
+            init_h = self.TRAIN_CONFIGS['init_h']
+            base = self.TRAIN_CONFIGS['base']
+            # load data
+            Y, H, X, h0 = tensor_to_cuda(*self._load_train_data)
+            # split data
+            if self.TRAIN_CONFIGS['target'] == 'states':
+                y_train, y_val = H[:train_steps], H[train_steps:]
+            elif self.TRAIN_CONFIGS['target'] == 'outputs':
+                y_train, y_val = Y[:train_steps], Y[train_steps:]
+            x_train, x_val = X[:train_steps], X[train_steps:]
+            # prep model and optimizers
+            self.model.cuda()
+            optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2)
+            # trian
+            loss = [None]*nEpochs
+            val_loss = [None]*nEpochs
+            pbar = tqdm(total=nEpochs, leave=False)
+            for i in range(nEpochs):
+                # reset gradient
+                optimizer.zero_grad()
+                # generate prediction
+                y_hat, h_plus1 = self.model(x_train) if not init_h else self.model(x_train, h0)
+                y_hat = y_hat.squeeze()
+                # calculate loss
+                l = loss_func(y_hat, y_train, base=self.TRAIN_CONFIGS['base'], epoch=i)
+                loss[i] = l.item()
+                # learn from loss
+                l.backward()
+                optimizer.step()
+                scheduler.step(l.item())
+                # validate
+                with torch.no_grad():
+                    val_y_hat, _ = self.model(x_val) if not init_h else self.model(x_val, h_plus1)
+                    val_y_hat = val_y_hat.squeeze()
+                    l = loss_func(val_y_hat, y_val, base=self.TRAIN_CONFIGS['base'], epoch=i)
+                    val_loss[i] = l.item()
+                # decorator
+                pbar.set_description(f"Loss={loss[i]:.3f}. Val={val_loss[i]:.3f}")
+                pbar.update(1)
 
-        pbar.close()
-        self.epochs_trained += nEpochs
+            pbar.close()
+            self.epochs_trained += nEpochs
 
-        self.loss, self.val_loss            = loss, val_loss
-        self.train_y_hat, self.train_y_true = y_hat.detach().cpu().squeeze(), y_train.detach().cpu().squeeze()
-        self.val_y_hat, self.val_y_true     = val_y_hat.detach().cpu().squeeze(), y_val.detach().cpu().squeeze()
-
+            self.loss, self.val_loss            = loss, val_loss
+            self.train_y_hat, self.train_y_true = y_hat.detach().cpu().squeeze(), y_train.detach().cpu().squeeze()
+            self.val_y_hat, self.val_y_true     = val_y_hat.detach().cpu().squeeze(), y_val.detach().cpu().squeeze()
+            self.trained=True
+        else:
+            # this shouldn't ever be reached. It's a safety.
+            raise ValueError("Model has already been trained.")
         return (self.loss, self.val_loss), \
                (self.train_y_hat, self.train_y_true), \
                (self.val_y_hat, self.val_y_true)
@@ -215,8 +228,9 @@ class Trainer:
         with open(p, "wb") as f:
             pickle.dump(self, f)
 
-    def _gen_relative_graphs(self, hat, true, dimH, val_begins, trial_num=0, fname_prefix=None, freq=10):
-        Trainer.gen_relative_graphs(hat, true, dimH, val_begins, trial_num, self.TRAIN_CONFIGS.get("fig_dir"), fname_prefix, freq)
+    # TODO remove
+    # def _gen_relative_graphs(self, hat, true, dimH, val_begins, trial_num=0, fname_prefix=None, freq=10):
+    #     Trainer.gen_relative_graphs(hat, true, dimH, val_begins, trial_num, self.TRAIN_CONFIGS.get("fig_dir"), fname_prefix, freq)
 
     @staticmethod
     def pickled_exists(TRAIN_CONFIGS, trial_num):
@@ -232,26 +246,30 @@ class Trainer:
         return path.join(model_dir,name)
 
     @staticmethod
-    def _gen_relative_graphs(hat, true, dimH, val_begins, trial_num=0, fig_dir=None, fname_prefix=None, freq=10, pause=False):
+    def _gen_relative_graphs(hat, true, dimOut, val_begins, trial_num, isState, fig_dir=None, fname_prefix=None, freq=10, pause=False):
         val_ends = hat.shape[0]
-        palette ={"H1": "C0", "H2": "C1", "H3": "C2"}
-        for _base in range(dimH):
+        palette ={"H1": "C0", "H2": "C1", "H3": "C2",
+                  "Y1": "C0", "Y2": "C1", "Y3": "C2"}
+        for _base in range(dimOut):
             _dif = rel_space_dif(hat, true, _base)
             df = pd.DataFrame(_dif)
             df = df.drop(_base, axis=1)
-            df.columns = "H"+ (df.columns+1).astype(str)
-            df.columns.name = "Hidden States"
+            _pre = "H" if isState else "Y"
+            df.columns = _pre + (df.columns+1).astype(str)
+            df.columns.name = "Hidden States" if isState else "Output Indices"
             df.index.name = "Itteration"
             df = df.stack()
             df.name = "Error"
             df = df.reset_index()
             _df = df[df['Itteration'] % freq == 0]
             plt.axhline(0,color="k", alpha=0.5)
-            sns.lineplot(data=_df, x="Itteration", y="Error", hue="Hidden States", alpha=1, palette=palette)
-            plt.title(f"Relative Difference (Base: H{_base+1})")
+            _hue = "Hidden States" if isState else "Output Indices"
+            sns.lineplot(data=_df, x="Itteration", y="Error", hue=_hue, alpha=1, palette=palette)
+
+            plt.title(f"Relative Difference (Base: {_pre}{_base+1})")
             plt.axvspan(val_begins, val_ends, facecolor="0.1", alpha=0.25)
             if not fname_prefix is None and not fig_dir is None:
-                fname = fname_prefix+f"-relgraph-H{_base+1}-trial{trial_num}"
+                fname = fname_prefix+f"-relgraph-{_pre}{_base+1}-trial{trial_num}"
                 f = path.join(fig_dir, fname)
                 plt.savefig(path.join(fig_dir, fname))
             else:
@@ -282,7 +300,7 @@ class Trainer:
     def gen_relative_graphs(self, trial_num, freq=10, pause=False):
         train_hat, train_true, val_hat, val_true = self.train_y_hat, self.train_y_true, self.val_y_hat, self.val_y_true
         # derived
-        dimH = train_hat.shape[-1]
+        dimOut = train_hat.shape[-1]
         val_begins = train_hat.shape[0]
         # combine predictions and true values
         hat = np.concatenate([train_hat, val_hat])
@@ -290,12 +308,15 @@ class Trainer:
         # graph
         fprefix = self.TRAIN_CONFIGS.get("lti_file").split(".pickle")[0]
 
-        Trainer._gen_relative_graphs(hat, true, dimH, val_begins, trial_num, self.TRAIN_CONFIGS.get("fig_dir"), fprefix, freq=10, pause=False)
+        isState = self.TRAIN_CONFIGS.get("target") == "state"
+        Trainer._gen_relative_graphs(hat, true, dimOut, val_begins, trial_num, isState, self.TRAIN_CONFIGS.get("fig_dir"), fprefix, freq=10, pause=False)
         
     @property
     def get_train_test_metrics(self):
+        isState = self.TRAIN_CONFIGS.get("target") == "state"
+
         state_tups = [(self.train_y_hat, self.train_y_true), (self.val_y_hat, self.val_y_true)]
-        train, test = [all_state_metrics(state_hat, state_true) for state_hat, state_true in state_tups]
+        train, test = [all_state_metrics(state_hat, state_true, isState) for state_hat, state_true in state_tups]
 
         return train, test
 

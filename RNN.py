@@ -9,7 +9,9 @@ class RNN(nn.Module):
             self.FFN = None
         else: #  target == "outputs"
             # self.FFN = ... TODO determine how this implementation should work...
-            raise ValueError(f"target value '{target}' has not been implemented yet.")
+            print(f"target value '{target}' has not been implemented yet. But will continue...")
+            self.FFN = None
+            # raise ValueError(f"target value '{target}' has not been implemented yet.")
         self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, bias=bias)
 
     def forward(self, X, h0 = None):
